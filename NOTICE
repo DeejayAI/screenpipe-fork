@@ -1,0 +1,27 @@
+Meridiona/screenpipe-fork
+==========================
+
+This repository is a fork of mediar-ai/screenpipe
+(https://github.com/mediar-ai/screenpipe) imported as a clean snapshot at
+commit 892199f74 — the LAST commit published under the MIT License.
+
+screenpipe relicensed from MIT to a Commercial license on 2026-06-10
+(first commercial commit: 81e412ff5). The MIT grant on commits up to and
+including 892199f74 is perpetual and irrevocable for those published
+versions; this fork uses ONLY that MIT-licensed snapshot.
+
+  * NO code at or after 81e412ff5 (the commercial relicense) is included.
+  * The original MIT license is preserved verbatim in LICENSE.md.
+  * The full upstream tree at 892199f74 is imported whole (not cherry-picked).
+    The tree is verifiable against a fresh upstream checkout:
+        git clone https://github.com/mediar-ai/screenpipe && \
+          cd screenpipe && git checkout 892199f74
+    and diffing against the import commit here.
+
+Purpose: Meridiona forks this snapshot to run screen capture IN-PROCESS inside
+the Meridian macOS app (linking the screenpipe-screen / screenpipe-a11y /
+screenpipe-db crates as libraries). See the Meridian repo for usage.
+
+Trademark: "Screenpipe" is a trademark of mediar-ai. This fork does not use
+that mark in any distributed product; the repository name records provenance
+only.
