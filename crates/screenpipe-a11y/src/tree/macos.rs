@@ -491,6 +491,11 @@ impl MacosTreeWalker {
                 inside_webarea: false,
                 in_terminal_subtree: false,
             };
+        } else if is_browser(&app_lower) {
+            // Browser: prune tab strip + toolbar so node budget reaches page content.
+            state.app = AppState::Browser {
+                inside_webarea: false,
+            };
         }
 
         if let Some((wx, wy, ww, wh)) = get_element_frame(window) {
@@ -617,6 +622,16 @@ enum AppState {
         /// `true` while the walk is inside the deep terminal `AXList`.
         /// Saved and restored around each such subtree.
         in_terminal_subtree: bool,
+    },
+    /// Chromium-based browser (Chrome, Arc, Edge, Brave, …).
+    ///
+    /// Before entering the page `AXWebArea`, the tab strip (`AXTabGroup`) and
+    /// browser toolbar (`AXToolbar`) are pruned entirely — they hold one AX node
+    /// per open tab and can exhaust the node budget before the walker reaches page
+    /// content. Once inside `AXWebArea` the full budget is available for the DOM.
+    Browser {
+        /// `true` once the walk has entered the focused tab's `AXWebArea`.
+        inside_webarea: bool,
     },
 }
 
@@ -1056,6 +1071,9 @@ fn walk_element(elem: &ax::UiElement, depth: usize, state: &mut WalkState) {
         if let AppState::VsCode { inside_webarea, .. } = &mut state.app {
             *inside_webarea = true;
         }
+        if let AppState::Browser { inside_webarea } = &mut state.app {
+            *inside_webarea = true;
+        }
     }
     let is_vscode_terminal_list = is_vscode_terminal_list_role(&role_str, depth, &state.app);
     if is_vscode_terminal_list
@@ -1070,8 +1088,21 @@ fn walk_element(elem: &ax::UiElement, depth: usize, state: &mut WalkState) {
         return; // prune entire terminal subtree — no children walked, no text emitted
     }
 
+    // Browser: prune the tab strip (AXTabGroup) and navigation toolbar (AXToolbar)
+    // before we enter the page AXWebArea. A window with many tabs can have hundreds
+    // of AX nodes in the tab strip, exhausting the node budget before the walker
+    // ever reaches page content. Once inside_webarea is true the full budget is
+    // spent on the DOM (AXStaticText, AXHeading, AXLink, …).
+    if matches!(state.app, AppState::Browser { inside_webarea: false }) {
+        if role_str == "AXTabGroup" || role_str == "AXToolbar" {
+            return; // prune subtree — no children walked, no text emitted
+        }
+    }
+
     // Extract text from this element.
     // In VS Code terminal mode, suppress text outside the terminal AXList subtree.
+    // In browser mode, suppress chrome-UI roles (AXTab, AXButton, AXDisclosureTriangle)
+    // before entering the page — after entering, emit everything including web buttons.
     if should_extract_text(&role_str) {
         let emit = match state.app {
             AppState::VsCode {
@@ -1079,6 +1110,13 @@ fn walk_element(elem: &ax::UiElement, depth: usize, state: &mut WalkState) {
                 in_terminal_subtree,
                 ..
             } => in_terminal_subtree,
+            AppState::Browser { inside_webarea } => {
+                inside_webarea
+                    || !matches!(
+                        role_str.as_str(),
+                        "AXTab" | "AXButton" | "AXDisclosureTriangle"
+                    )
+            }
             _ => true,
         };
         if emit {
