@@ -147,9 +147,48 @@ pub mod macos_version {
     pub static MACOS_VERSION: Lazy<(u32, u32)> =
         Lazy::new(|| get_macos_version().unwrap_or((0, 0)));
 
-    /// Check if we should use sck-rs (requires macOS 12.3+)
+    /// Check if we should use sck-rs (requires macOS 12.3+, and not macOS 26+).
+    ///
+    /// # macOS 26 opt-out
+    ///
+    /// On macOS 26 the very first `sc::ShareableContent::current()` aborts the
+    /// process. The over-release happens inside ScreenCaptureKit's own XPC
+    /// reply teardown, on the `com.apple.NSXPCConnection.m-user.com.apple.replayd`
+    /// thread:
+    ///
+    /// ```text
+    /// _Block_release
+    /// ScreenCaptureKit __destroy_helper_block_e8_32s40s
+    /// ___BUG_IN_CLIENT_OF_LIBMALLOC_POINTER_BEING_FREED_WAS_NOT_ALLOCATED
+    /// abort
+    /// ```
+    ///
+    /// i.e. the completion block handed to `SCShareableContent` is released
+    /// once too often — a bug in the sck-rs/cidre binding, not in SCK. A
+    /// standalone Swift program calling the same API on the same machine
+    /// enumerates displays/apps/windows and exits cleanly, and the abort still
+    /// reproduces with cidre unified to one build and with cidre upstream HEAD
+    /// (0.16.1), so it is neither version skew nor duplicate ObjC glue.
+    ///
+    /// This has to be decided UP FRONT rather than attempted and recovered
+    /// from: a libmalloc double-free calls `abort()` directly, so there is no
+    /// error to match on and nothing to catch — the first call takes the whole
+    /// process down. The xcap/CoreGraphics path below is unaffected.
+    ///
+    /// This is a mitigation, not a cure. `xcap` uses `CGWindowListCreateImage`,
+    /// deprecated since macOS 14, so the real fix is repairing the binding and
+    /// then dropping this gate. Set `SCREENPIPE_FORCE_SCK=1` to re-enable
+    /// ScreenCaptureKit and check whether a newer sck-rs/cidre has fixed it.
     pub fn use_sck_rs() -> bool {
         let (major, minor) = *MACOS_VERSION;
+        if major >= 26 && std::env::var_os("SCREENPIPE_FORCE_SCK").is_none() {
+            tracing::debug!(
+                macos_major = major,
+                "sck-rs disabled on macOS 26+ (SCShareableContent block over-release); \
+                 using xcap/CoreGraphics — set SCREENPIPE_FORCE_SCK=1 to override"
+            );
+            return false;
+        }
         major > 12 || (major == 12 && minor >= 3)
     }
 
