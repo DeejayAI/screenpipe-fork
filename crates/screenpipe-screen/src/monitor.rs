@@ -147,13 +147,15 @@ pub mod macos_version {
     pub static MACOS_VERSION: Lazy<(u32, u32)> =
         Lazy::new(|| get_macos_version().unwrap_or((0, 0)));
 
-    /// Check if we should use sck-rs (requires macOS 12.3+, and not macOS 26+).
+    /// Whether to use sck-rs's ScreenCaptureKit path. Currently **disabled on
+    /// every macOS version** (falls back to xcap/CoreGraphics) unless
+    /// `SCREENPIPE_FORCE_SCK=1` is set.
     ///
-    /// # macOS 26 opt-out
+    /// # Disabled unconditionally — not just on macOS 26+
     ///
-    /// On macOS 26 the very first `sc::ShareableContent::current()` aborts the
-    /// process. The over-release happens inside ScreenCaptureKit's own XPC
-    /// reply teardown, on the `com.apple.NSXPCConnection.m-user.com.apple.replayd`
+    /// The very first `sc::ShareableContent::current()` call can abort the
+    /// process with a double-free inside ScreenCaptureKit's own XPC reply
+    /// teardown, on the `com.apple.NSXPCConnection.m-user.com.apple.replayd`
     /// thread:
     ///
     /// ```text
@@ -170,6 +172,17 @@ pub mod macos_version {
     /// reproduces with cidre unified to one build and with cidre upstream HEAD
     /// (0.16.1), so it is neither version skew nor duplicate ObjC glue.
     ///
+    /// Originally gated to macOS 26+ only, where the over-release is
+    /// deterministic (aborts on the very first call, every time). Widened to
+    /// every macOS version after an independent field report on macOS 14.7.4
+    /// collected 14 crash reports with the *identical* faulting-thread queue
+    /// (`com.apple.NSXPCConnection.m-user.com.apple.replayd`) and backtrace —
+    /// reproducing intermittently (not on every call) under heavy swap/memory
+    /// pressure rather than deterministically. Same use-after-free/double-free,
+    /// just exposed as a probabilistic race pre-26 instead of a guaranteed one
+    /// on 26+. There is no evidence the binding is safe on any macOS version,
+    /// only that lower memory pressure makes the race harder to hit.
+    ///
     /// This has to be decided UP FRONT rather than attempted and recovered
     /// from: a libmalloc double-free calls `abort()` directly, so there is no
     /// error to match on and nothing to catch — the first call takes the whole
@@ -180,15 +193,17 @@ pub mod macos_version {
     /// then dropping this gate. Set `SCREENPIPE_FORCE_SCK=1` to re-enable
     /// ScreenCaptureKit and check whether a newer sck-rs/cidre has fixed it.
     pub fn use_sck_rs() -> bool {
-        let (major, minor) = *MACOS_VERSION;
-        if major >= 26 && std::env::var_os("SCREENPIPE_FORCE_SCK").is_none() {
+        if std::env::var_os("SCREENPIPE_FORCE_SCK").is_none() {
             tracing::debug!(
-                macos_major = major,
-                "sck-rs disabled on macOS 26+ (SCShareableContent block over-release); \
-                 using xcap/CoreGraphics — set SCREENPIPE_FORCE_SCK=1 to override"
+                "sck-rs disabled (SCShareableContent completion-block over-release; \
+                 reproduces on multiple macOS versions, deterministically on 26+ and as a \
+                 memory-pressure-dependent race below it); using xcap/CoreGraphics — \
+                 set SCREENPIPE_FORCE_SCK=1 to override"
             );
             return false;
         }
+        // Still gate the override on sck-rs's actual minimum OS requirement.
+        let (major, minor) = *MACOS_VERSION;
         major > 12 || (major == 12 && minor >= 3)
     }
 
