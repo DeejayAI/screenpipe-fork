@@ -32,6 +32,29 @@ use objc2_app_kit::NSPasteboard;
 /// and cause a SIGABRT in CFDictionarySetValue / __CFBasicHashRehash.
 static AX_QUERY_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
+/// Guard serializing the workspace-observer lifecycle in [`run_app_observer`]
+/// against `ns::Workspace::shared().notification_center()` — the single
+/// process-wide `NSWorkspaceNotificationCenter` singleton.
+///
+/// A host that stops one recording session and immediately starts another
+/// (pause/resume, a settings change, permission re-grant) can otherwise have
+/// two `run_app_observer` invocations alive at once: the outgoing one hasn't
+/// finished unregistering its `NotificationGuard`s yet (its `stop` flag is
+/// checked on its own cadence) while the incoming one is already registering
+/// fresh ones on the very same singleton. Two threads mutating the same
+/// `NSNotificationCenter`'s block-based observer list at once has been
+/// observed to double-free the underlying `Block` on removal —
+/// `-[NSNotificationCenter removeObserver:] -> CFXNotificationRegistrarRemoveToken
+/// -> _Block_release -> malloc: BUG_IN_CLIENT_OF_LIBMALLOC …
+/// POINTER_BEING_FREED_WAS_NOT_ALLOCATED -> abort`.
+///
+/// Holding this for the *entire* lifetime of one `run_app_observer` call —
+/// acquired before `_workspace_observers` is built, released only after it
+/// (and thus every guard's `Drop`) has run — guarantees at most one thread
+/// is ever touching the shared notification center, regardless of how a
+/// caller sequences starting and stopping recording sessions.
+static WORKSPACE_OBSERVER_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// Process-wide ground truth for macOS Input Monitoring, learned from the ONE
 /// real CGEventTap we create in `run_event_tap` / `run_activity_only_tap`.
 ///
@@ -1319,6 +1342,12 @@ fn run_app_observer(
     current_app: Arc<ArcSwap<Option<String>>>,
     current_window: Arc<ArcSwap<Option<String>>>,
 ) {
+    // Held for this whole function — see `WORKSPACE_OBSERVER_LOCK`'s doc comment.
+    // Declared before `_workspace_observers` so Rust's reverse-drop-order runs
+    // every `NotificationGuard::drop` (the `removeObserver:` calls) while this
+    // is still locked, and only then releases it.
+    let _workspace_observer_lock = WORKSPACE_OBSERVER_LOCK.lock();
+
     let workspace = ns::Workspace::shared();
     let mut notification_center = workspace.notification_center();
     let refresh_requested = Arc::new(AtomicBool::new(true));
