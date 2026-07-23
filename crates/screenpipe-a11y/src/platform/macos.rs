@@ -1477,11 +1477,25 @@ fn run_app_observer(
     };
 
     while !stop.load(Ordering::Acquire) {
-        cf::RunLoop::run_in_mode(run_loop_mode, 0.1, true);
+        // Wrap each run-loop iteration in an autorelease pool. This is a
+        // manually-driven CFRunLoop on a secondary thread — unlike the main
+        // thread's NSRunLoop, it gets NO automatic per-iteration autorelease
+        // draining. `run_in_mode` synchronously dispatches
+        // `ax_focus_observer_callback` (-> `emit_focus_state`, which reads AX/
+        // `ns::RunningApp` state) and `reattach_observer` below does more of
+        // the same — all producing autoreleased NSObjects. This thread runs
+        // for the entire 24/7 capture session, so without a drain here those
+        // objects accumulate forever. Same idiom as the per-call wrap in
+        // `MacosTreeWalker::walk_focused_window` (tree/macos.rs), applied
+        // per-iteration since this loop — not its caller — is the long-lived
+        // unit of work.
+        cidre::objc::ar_pool(|| {
+            cf::RunLoop::run_in_mode(run_loop_mode, 0.1, true);
 
-        if refresh_requested.swap(false, Ordering::SeqCst) {
-            reattach_observer();
-        }
+            if refresh_requested.swap(false, Ordering::SeqCst) {
+                reattach_observer();
+            }
+        });
     }
 
     // CRITICAL: Properly disconnect from Chromium/Electron before exit.
