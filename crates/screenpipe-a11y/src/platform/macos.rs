@@ -49,10 +49,19 @@ static AX_QUERY_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 /// POINTER_BEING_FREED_WAS_NOT_ALLOCATED -> abort`.
 ///
 /// Holding this for the *entire* lifetime of one `run_app_observer` call —
-/// acquired before `_workspace_observers` is built, released only after it
-/// (and thus every guard's `Drop`) has run — guarantees at most one thread
-/// is ever touching the shared notification center, regardless of how a
-/// caller sequences starting and stopping recording sessions.
+/// acquired before `workspace_observers` is built, released only after
+/// registration (and, historically, every guard's `Drop`) has run —
+/// guarantees at most one thread is ever touching the shared notification
+/// center, regardless of how a caller sequences starting and stopping
+/// recording sessions.
+///
+/// The removal half of that story no longer runs: `run_app_observer` now
+/// leaks its `workspace_observers` (`std::mem::forget`, see its call site)
+/// because `removeObserver:name:object:` itself reproduces the same abort
+/// deterministically on macOS 26.3, even single-threaded — this lock
+/// doesn't cover *that* failure mode. It's kept because registration
+/// (`add_observer_guard`) still needs serializing against the same
+/// singleton.
 static WORKSPACE_OBSERVER_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Process-wide ground truth for macOS Input Monitoring, learned from the ONE
@@ -1352,7 +1361,7 @@ fn run_app_observer(
     current_window: Arc<ArcSwap<Option<String>>>,
 ) {
     // Held for this whole function — see `WORKSPACE_OBSERVER_LOCK`'s doc comment.
-    // Declared before `_workspace_observers` so Rust's reverse-drop-order runs
+    // Declared before `workspace_observers` so Rust's reverse-drop-order runs
     // every `NotificationGuard::drop` (the `removeObserver:` calls) while this
     // is still locked, and only then releases it.
     let _workspace_observer_lock = WORKSPACE_OBSERVER_LOCK.lock();
@@ -1377,7 +1386,7 @@ fn run_app_observer(
 
     // NSWorkspace still helps for session/space lifecycle changes, but app-to-app
     // reattachment comes from AX notifications on the observed app itself.
-    let _workspace_observers = [
+    let workspace_observers = [
         notification_center.add_observer_guard(
             ns::workspace::notification::did_activate_app(),
             None,
@@ -1562,6 +1571,32 @@ fn run_app_observer(
     }
 
     debug!("AXObserver shutdown: complete");
+
+    // Leak the NSWorkspace observer guards instead of letting them drop.
+    //
+    // `NotificationGuard::drop` calls `-[NSWorkspaceNotificationCenter
+    // removeObserver:name:object:]`, which has been observed to
+    // deterministically abort on this OS (macOS 26.3) — SIGABRT /
+    // `BUG_IN_CLIENT_OF_LIBMALLOC_POINTER_BEING_FREED_WAS_NOT_ALLOCATED` via
+    // `_Block_release` <- `_CFXNotificationDisposalListRelease` <-
+    // `CFXNotificationRegistrarRemoveToken`, i.e. a double-free somewhere in
+    // Foundation's own Block-based notification-token bookkeeping — not a
+    // bug in our registration code (single call site, single thread, still
+    // reproduces on the very first teardown of a freshly started recorder).
+    // Wrapping the run loop in an autorelease pool (c29722d) did not change
+    // this — it is not an autorelease-accumulation issue.
+    //
+    // These are 5 tiny blocks whose only job is to flip `refresh_requested`;
+    // never unregistering them means a stale generation keeps refreshing a
+    // now-dead `Arc<AtomicBool>` harmlessly (nothing reads it once this
+    // thread has exited) at the cost of leaking 5 small block registrations
+    // per pause/resume cycle — the same accepted trade-off already made for
+    // `screenpipe-engine`'s focus-tracker CF thread (see its module doc:
+    // "the leak is a few KB"). A real fix needs native-level (lldb / Malloc
+    // Stack Logging) debugging of Foundation's token bookkeeping; tracked as
+    // a follow-up. Trading an unbounded-but-slow leak for a deterministic
+    // crash is the right call until then.
+    std::mem::forget(workspace_observers);
 
     unsafe {
         drop(Box::from_raw(callback_state_ptr));
