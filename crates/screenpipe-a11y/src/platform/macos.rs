@@ -783,26 +783,35 @@ fn run_event_tap(
         .name("ctx-capture".into())
         .spawn(move || {
             while let Ok(req) = context_rx.recv() {
-                if let Some(element) = get_element_at_position(req.x, req.y, &req.config) {
-                    let ctx_event = UiEvent {
-                        id: None,
-                        timestamp: Utc::now(),
-                        relative_ms: req.start.elapsed().as_millis() as u64,
-                        data: EventData::Click {
-                            x: req.x as i32,
-                            y: req.y as i32,
-                            button: 0,
-                            click_count: 0,
-                            modifiers: 0,
-                        },
-                        app_name: req.app_name,
-                        window_title: req.window_title,
-                        browser_url: None,
-                        element: Some(element),
-                        frame_id: None,
-                    };
-                    let _ = req.tx.try_send(ctx_event);
-                }
+                // Wrap each per-click context capture in an autorelease pool —
+                // `get_element_at_position` does AX reads (role/title/desc/
+                // value) that create autoreleased NSObjects. This worker
+                // thread lives for the whole capture session and fires on
+                // every mouse-down, so without a per-iteration drain those
+                // objects accumulate forever. Same idiom as `run_app_observer`'s
+                // per-iteration wrap above.
+                cidre::objc::ar_pool(|| {
+                    if let Some(element) = get_element_at_position(req.x, req.y, &req.config) {
+                        let ctx_event = UiEvent {
+                            id: None,
+                            timestamp: Utc::now(),
+                            relative_ms: req.start.elapsed().as_millis() as u64,
+                            data: EventData::Click {
+                                x: req.x as i32,
+                                y: req.y as i32,
+                                button: 0,
+                                click_count: 0,
+                                modifiers: 0,
+                            },
+                            app_name: req.app_name,
+                            window_title: req.window_title,
+                            browser_url: None,
+                            element: Some(element),
+                            frame_id: None,
+                        };
+                        let _ = req.tx.try_send(ctx_event);
+                    }
+                });
             }
         })
         .ok();
