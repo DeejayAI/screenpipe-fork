@@ -10,6 +10,7 @@ pub mod frame_comparison;
 #[cfg(any(target_os = "windows", test))]
 pub mod microsoft;
 pub mod monitor;
+pub mod monitor_watch;
 #[cfg(target_os = "windows")]
 pub mod wgc_capture;
 #[cfg(target_os = "macos")]
