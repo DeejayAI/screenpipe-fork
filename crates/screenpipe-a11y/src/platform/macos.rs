@@ -49,10 +49,19 @@ static AX_QUERY_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 /// POINTER_BEING_FREED_WAS_NOT_ALLOCATED -> abort`.
 ///
 /// Holding this for the *entire* lifetime of one `run_app_observer` call —
-/// acquired before `_workspace_observers` is built, released only after it
-/// (and thus every guard's `Drop`) has run — guarantees at most one thread
-/// is ever touching the shared notification center, regardless of how a
-/// caller sequences starting and stopping recording sessions.
+/// acquired before `workspace_observers` is built, released only after
+/// registration (and, historically, every guard's `Drop`) has run —
+/// guarantees at most one thread is ever touching the shared notification
+/// center, regardless of how a caller sequences starting and stopping
+/// recording sessions.
+///
+/// The removal half of that story no longer runs: `run_app_observer` now
+/// leaks its `workspace_observers` (`std::mem::forget`, see its call site)
+/// because `removeObserver:name:object:` itself reproduces the same abort
+/// deterministically on macOS 26.3, even single-threaded — this lock
+/// doesn't cover *that* failure mode. It's kept because registration
+/// (`add_observer_guard`) still needs serializing against the same
+/// singleton.
 static WORKSPACE_OBSERVER_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Process-wide ground truth for macOS Input Monitoring, learned from the ONE
@@ -783,26 +792,35 @@ fn run_event_tap(
         .name("ctx-capture".into())
         .spawn(move || {
             while let Ok(req) = context_rx.recv() {
-                if let Some(element) = get_element_at_position(req.x, req.y, &req.config) {
-                    let ctx_event = UiEvent {
-                        id: None,
-                        timestamp: Utc::now(),
-                        relative_ms: req.start.elapsed().as_millis() as u64,
-                        data: EventData::Click {
-                            x: req.x as i32,
-                            y: req.y as i32,
-                            button: 0,
-                            click_count: 0,
-                            modifiers: 0,
-                        },
-                        app_name: req.app_name,
-                        window_title: req.window_title,
-                        browser_url: None,
-                        element: Some(element),
-                        frame_id: None,
-                    };
-                    let _ = req.tx.try_send(ctx_event);
-                }
+                // Wrap each per-click context capture in an autorelease pool —
+                // `get_element_at_position` does AX reads (role/title/desc/
+                // value) that create autoreleased NSObjects. This worker
+                // thread lives for the whole capture session and fires on
+                // every mouse-down, so without a per-iteration drain those
+                // objects accumulate forever. Same idiom as `run_app_observer`'s
+                // per-iteration wrap above.
+                cidre::objc::ar_pool(|| {
+                    if let Some(element) = get_element_at_position(req.x, req.y, &req.config) {
+                        let ctx_event = UiEvent {
+                            id: None,
+                            timestamp: Utc::now(),
+                            relative_ms: req.start.elapsed().as_millis() as u64,
+                            data: EventData::Click {
+                                x: req.x as i32,
+                                y: req.y as i32,
+                                button: 0,
+                                click_count: 0,
+                                modifiers: 0,
+                            },
+                            app_name: req.app_name,
+                            window_title: req.window_title,
+                            browser_url: None,
+                            element: Some(element),
+                            frame_id: None,
+                        };
+                        let _ = req.tx.try_send(ctx_event);
+                    }
+                });
             }
         })
         .ok();
@@ -1343,7 +1361,7 @@ fn run_app_observer(
     current_window: Arc<ArcSwap<Option<String>>>,
 ) {
     // Held for this whole function — see `WORKSPACE_OBSERVER_LOCK`'s doc comment.
-    // Declared before `_workspace_observers` so Rust's reverse-drop-order runs
+    // Declared before `workspace_observers` so Rust's reverse-drop-order runs
     // every `NotificationGuard::drop` (the `removeObserver:` calls) while this
     // is still locked, and only then releases it.
     let _workspace_observer_lock = WORKSPACE_OBSERVER_LOCK.lock();
@@ -1368,7 +1386,7 @@ fn run_app_observer(
 
     // NSWorkspace still helps for session/space lifecycle changes, but app-to-app
     // reattachment comes from AX notifications on the observed app itself.
-    let _workspace_observers = [
+    let workspace_observers = [
         notification_center.add_observer_guard(
             ns::workspace::notification::did_activate_app(),
             None,
@@ -1477,11 +1495,25 @@ fn run_app_observer(
     };
 
     while !stop.load(Ordering::Acquire) {
-        cf::RunLoop::run_in_mode(run_loop_mode, 0.1, true);
+        // Wrap each run-loop iteration in an autorelease pool. This is a
+        // manually-driven CFRunLoop on a secondary thread — unlike the main
+        // thread's NSRunLoop, it gets NO automatic per-iteration autorelease
+        // draining. `run_in_mode` synchronously dispatches
+        // `ax_focus_observer_callback` (-> `emit_focus_state`, which reads AX/
+        // `ns::RunningApp` state) and `reattach_observer` below does more of
+        // the same — all producing autoreleased NSObjects. This thread runs
+        // for the entire 24/7 capture session, so without a drain here those
+        // objects accumulate forever. Same idiom as the per-call wrap in
+        // `MacosTreeWalker::walk_focused_window` (tree/macos.rs), applied
+        // per-iteration since this loop — not its caller — is the long-lived
+        // unit of work.
+        cidre::objc::ar_pool(|| {
+            cf::RunLoop::run_in_mode(run_loop_mode, 0.1, true);
 
-        if refresh_requested.swap(false, Ordering::SeqCst) {
-            reattach_observer();
-        }
+            if refresh_requested.swap(false, Ordering::SeqCst) {
+                reattach_observer();
+            }
+        });
     }
 
     // CRITICAL: Properly disconnect from Chromium/Electron before exit.
@@ -1539,6 +1571,32 @@ fn run_app_observer(
     }
 
     debug!("AXObserver shutdown: complete");
+
+    // Leak the NSWorkspace observer guards instead of letting them drop.
+    //
+    // `NotificationGuard::drop` calls `-[NSWorkspaceNotificationCenter
+    // removeObserver:name:object:]`, which has been observed to
+    // deterministically abort on this OS (macOS 26.3) — SIGABRT /
+    // `BUG_IN_CLIENT_OF_LIBMALLOC_POINTER_BEING_FREED_WAS_NOT_ALLOCATED` via
+    // `_Block_release` <- `_CFXNotificationDisposalListRelease` <-
+    // `CFXNotificationRegistrarRemoveToken`, i.e. a double-free somewhere in
+    // Foundation's own Block-based notification-token bookkeeping — not a
+    // bug in our registration code (single call site, single thread, still
+    // reproduces on the very first teardown of a freshly started recorder).
+    // Wrapping the run loop in an autorelease pool (c29722d) did not change
+    // this — it is not an autorelease-accumulation issue.
+    //
+    // These are 5 tiny blocks whose only job is to flip `refresh_requested`;
+    // never unregistering them means a stale generation keeps refreshing a
+    // now-dead `Arc<AtomicBool>` harmlessly (nothing reads it once this
+    // thread has exited) at the cost of leaking 5 small block registrations
+    // per pause/resume cycle — the same accepted trade-off already made for
+    // `screenpipe-engine`'s focus-tracker CF thread (see its module doc:
+    // "the leak is a few KB"). A real fix needs native-level (lldb / Malloc
+    // Stack Logging) debugging of Foundation's token bookkeeping; tracked as
+    // a follow-up. Trading an unbounded-but-slow leak for a deterministic
+    // crash is the right call until then.
+    std::mem::forget(workspace_observers);
 
     unsafe {
         drop(Box::from_raw(callback_state_ptr));
