@@ -521,8 +521,16 @@ async fn process_window_ocr(
         *window_count += 1;
     }
 
+    // Redact PII from the raw OCR output before it goes anywhere else. This is the
+    // single choke point for every engine (Tesseract/WindowsNative/AppleNative/
+    // Custom/cloud) since they all funnel through perform_ocr_with_engine above —
+    // mirrors screenpipe-a11y's apply_pii_removal, which the OCR path previously
+    // had no equivalent of.
+    let window_text = screenpipe_core::remove_pii(&window_text);
+
     // Parse the OCR JSON and transform coordinates from window-relative to screen-relative
     let parsed_json = parse_json_output(&window_json_output);
+    let parsed_json = screenpipe_core::remove_pii_from_text_json(&parsed_json);
     let transformed_json = transform_ocr_coordinates_to_screen(
         parsed_json,
         captured_window.window_x,
@@ -789,5 +797,63 @@ mod tests {
         assert_close(number(block, "top"), 0.133_333_333_333_333_33);
         assert_close(number(block, "width"), 0.125);
         assert_close(number(block, "height"), 0.066_666_666_666_666_67);
+    }
+
+    /// Exercises the exact redaction wiring added to `process_window_ocr`:
+    /// raw engine output (word-level JSON + concatenated text) containing a
+    /// credit card number and an SSN must come out redacted after
+    /// `remove_pii`/`remove_pii_from_text_json` + coordinate transform — the
+    /// same pipeline every OCR engine (Tesseract/AppleNative/WindowsNative/
+    /// Custom) funnels through via `perform_ocr_with_engine`. A live OCR
+    /// engine can't run in this sandbox (no bundled Tesseract/Vision model),
+    /// so this pins the post-engine half of the pipeline instead — the half
+    /// this change actually touches.
+    #[test]
+    fn ocr_pipeline_redacts_pii_before_coordinate_transform() {
+        let raw_text = "call me at 4111 1111 1111 1111 or ssn 123-45-6789";
+        let raw_json = r#"[
+            {"text":"4111111111111111","left":"0.10","top":"0.10","width":"0.10","height":"0.05"},
+            {"text":"123-45-6789","left":"0.30","top":"0.10","width":"0.15","height":"0.05"},
+            {"text":"harmless","left":"0.50","top":"0.10","width":"0.10","height":"0.05"}
+        ]"#;
+
+        // Mirrors the two lines added to process_window_ocr.
+        let redacted_text = screenpipe_core::remove_pii(raw_text);
+        let parsed_json = parse_json_output(raw_json);
+        let redacted_json = screenpipe_core::remove_pii_from_text_json(&parsed_json);
+        let transformed = transform_ocr_coordinates_to_screen(
+            redacted_json,
+            40,
+            30,
+            100,
+            50,
+            400,
+            300,
+        );
+
+        assert!(
+            !redacted_text.contains("4111 1111 1111 1111"),
+            "credit card leaked into OCR text: {redacted_text}"
+        );
+        assert!(
+            !redacted_text.contains("123-45-6789"),
+            "SSN leaked into OCR text: {redacted_text}"
+        );
+        assert!(redacted_text.contains("[CREDIT_CARD]"));
+        assert!(redacted_text.contains("[SSN]"));
+
+        let texts: Vec<&str> = transformed
+            .iter()
+            .map(|block| block.get("text").map(String::as_str).unwrap_or(""))
+            .collect();
+        assert!(!texts.iter().any(|t| t.contains("4111111111111111")));
+        assert!(!texts.iter().any(|t| t.contains("123-45-6789")));
+        assert_eq!(texts, vec!["[CREDIT_CARD]", "[SSN]", "harmless"]);
+
+        // Coordinate transform still ran on the redacted blocks (this isn't
+        // just skipping/dropping them) — the numeric fields must survive.
+        let first = &transformed[0];
+        assert!(number(first, "left") > 0.0);
+        assert!(number(first, "top") > 0.0);
     }
 }
