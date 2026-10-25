@@ -330,6 +330,21 @@ impl MacosTreeWalker {
             Some(focused) => focused,
             None => return Ok(TreeWalkResult::NotFound),
         };
+        // SELF-WALK GUARD: never descend into our own process's windows from
+        // this background-thread walk. When the focused window is a WKWebView
+        // belonging to this app (a dashboard embedded in the tray), walking it
+        // reaches WebKit accessibility API off the main thread, and WebKit
+        // deliberately crashes the process for that:
+        //   WebKit::crashDueToApplicationCallingMainThreadOnlyWebKitAPIFromBackgroundThread
+        // (measured 2026-10-25 via Alpha Concierge's capture engine). Returning
+        // Skipped keeps the capture tick alive - the caller falls back to OCR or
+        // simply records nothing for a window that is ours to begin with.
+        // PID compare is authoritative; name-based matching cannot be (the AX
+        // reported name changes with setProcessName:, and the check would run
+        // after the walk that kills us).
+        if pid == std::process::id() as i32 {
+            return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
+        }
 
         // Skip excluded apps (password managers, etc.)
         let app_lower = app_name.to_lowercase();
